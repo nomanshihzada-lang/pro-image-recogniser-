@@ -1,0 +1,1959 @@
+require "import"
+import "cjson"
+import "android.widget.*"
+import "android.os.*"
+import "android.view.*"
+import "android.content.Context"
+import "android.graphics.Color"
+import "android.graphics.Typeface"
+import "android.graphics.drawable.ColorDrawable"
+import "android.graphics.drawable.GradientDrawable"
+import "android.content.Intent"
+import "android.net.Uri"
+import "android.provider.MediaStore"
+import "java.io.File"
+import "java.io.FileWriter"
+import "java.lang.Class"
+import "android.text.InputType"
+import "android.widget.LinearLayout$LayoutParams"
+import "java.net.URLEncoder"
+import "java.lang.System"
+import "com.androlua.Http"
+import "android.graphics.Bitmap"
+import "android.graphics.BitmapFactory"
+import "android.graphics.Rect"
+import "android.util.Base64"
+import "java.io.ByteArrayOutputStream"
+import "android.view.accessibility.AccessibilityNodeInfo"
+import "android.media.ToneGenerator"
+import "android.media.AudioManager"
+import "android.media.RingtoneManager"
+import "android.media.MediaPlayer"
+import "android.media.MediaRecorder"
+import "android.util.Log"
+import "java.util.HashMap"
+import "android.speech.RecognizerIntent"
+import "java.util.ArrayList"
+import "android.speech.SpeechRecognizer"
+
+-- Bypass Android FileUriExposedException & Thread Policies
+pcall(function()
+    local policy = StrictMode.ThreadPolicy.Builder().permitAll().build()
+    StrictMode.setThreadPolicy(policy)
+    local strictCls = Class.forName("android.os.StrictMode")
+    local disableMethod = strictCls.getMethod("disableDeathOnFileUriExposure", nil)
+    disableMethod.invoke(nil, nil)
+end)
+
+-- ==================== CORE CONTEXT & HELPERS ====================
+local ctx = service or this
+local File_CLASS = luajava.bindClass("java.io.File")
+local LIGHT_BLUE = 0xFFADD8E6
+
+local function applyLightBlue(dlg)
+    pcall(function()
+        local win = dlg.getWindow()
+        if win then
+            win.setBackgroundDrawable(ColorDrawable(LIGHT_BLUE))
+            win.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE or WindowManager.LayoutParams.SOFT_INPUT_STATE_HIDDEN)
+        end
+    end)
+end
+
+local mainHandler = Handler(Looper.getMainLooper())
+
+local function runOnMain(fn)
+    pcall(function()
+        if Looper.myLooper() == Looper.getMainLooper() then fn()
+        else mainHandler.post(Runnable({ run = fn })) end
+    end)
+end
+
+function notify(msg)
+    runOnMain(function()
+        pcall(function() if service and service.speak then service.speak(tostring(msg)) end end)
+        pcall(function() Toast.makeText(ctx, tostring(msg), Toast.LENGTH_SHORT).show() end)
+    end)
+end
+
+-- ==================== PREFERENCES & MODEL SETUP ====================
+local AI_PREFS = "ImageRecognizerProAI"
+local aiPrefs = ctx.getSharedPreferences(AI_PREFS, Context.MODE_PRIVATE)
+local aiEditor = aiPrefs.edit()
+
+local GROQ_MODELS = {
+    "Qwen 3.8 27B Vision (Official)",
+    "Llama 4 Scout Vision"
+}
+local groqModelIds = {
+    ["Qwen 3.8 27B Vision (Official)"] = "qwen/qwen3.8-27b",
+    ["Llama 4 Scout Vision"]           = "meta-llama/llama-4-scout-17b-16e-instruct"
+}
+local GROQ_FALLBACK_ORDER = {
+    "qwen/qwen3.8-27b",
+    "meta-llama/llama-4-scout-17b-16e-instruct"
+}
+
+local LANGUAGES = {
+    "English",
+    "Roman Urdu",
+    "Simple Urdu (丕乇丿賵)",
+    "Arabic (丕賱毓乇亘賷丞)",
+    "French (Fran莽ais)"
+}
+
+local LANGUAGE_INSTRUCTIONS = {
+    ["English"]            = "Answer in clear English.",
+    ["Roman Urdu"]         = "Answer in Roman Urdu (Urdu written in English alphabets).",
+    ["Simple Urdu (丕乇丿賵)"] = "Answer in simple, easy-to-understand Urdu script (丕乇丿賵).",
+    ["Arabic (丕賱毓乇亘賷丞)"]   = "Answer in clear Arabic (丕賱毓乇亘賷丞).",
+    ["French (Fran莽ais)"]  = "Answer in clear French (Fran莽ais)."
+}
+
+local DESCRIPTION_LENGTHS = {
+    "Small",
+    "Medium",
+    "Large"
+}
+
+local LENGTH_INSTRUCTIONS = {
+    ["Small"]  = "Keep the visual description very short and brief (only 2 to 3 short sentences covering the main subject).",
+    ["Medium"] = "Keep the visual description medium length and balanced (around 4 to 6 clear sentences covering key details).",
+    ["Large"]  = "Provide a comprehensive, detailed visual description (around 8 to 10 sentences covering all objects, colors, and context)."
+}
+
+local photoFilePaths = {}
+local selectedPhotoPath = ""
+local mainDlg = nil
+local currentAboutDlg = nil
+local isProcessing = false
+
+function getGroqApiKey() return aiPrefs.getString("groq_apiKey", "") end
+function saveGroqApiKey(k) aiEditor.putString("groq_apiKey", k); aiEditor.commit() end
+
+function getGroqModel() return aiPrefs.getString("groq_model", "Qwen 3.8 27B Vision (Official)") end
+function saveGroqModel(m) aiEditor.putString("groq_model", m); aiEditor.commit() end
+
+function getSelectedLanguage() return aiPrefs.getString("selected_language", "English") end
+function saveSelectedLanguage(l) aiEditor.putString("selected_language", l); aiEditor.commit() end
+
+function getDescriptionLength() return aiPrefs.getString("description_length", "Medium") end
+function saveDescriptionLength(len) aiEditor.putString("description_length", len); aiEditor.commit() end
+
+function hasConsent() return aiPrefs.getBoolean("capture_consent", true) end
+function setConsent(v) aiEditor.putBoolean("capture_consent", v); aiEditor.commit() end
+
+-- ==================== AUDIO HARDWARE SOUNDS ====================
+local toneGen = nil
+local beepRunnable = nil
+local beepActive = false
+
+function playSingleBeep()
+    pcall(function()
+        local tg = ToneGenerator(AudioManager.STREAM_ALARM, 100)
+        tg.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 200)
+        mainHandler.postDelayed(Runnable({
+            run = function() pcall(function() tg.release() end) end
+        }), 300)
+    end)
+end
+
+function startProcessingSound()
+    stopProcessingSound()
+    pcall(function() toneGen = ToneGenerator(AudioManager.STREAM_ALARM, 100) end)
+    beepActive = true
+    beepRunnable = Runnable({
+        run = function()
+            if not beepActive then return end
+            pcall(function()
+                if toneGen then toneGen.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 200) end
+            end)
+            if beepActive then mainHandler.postDelayed(beepRunnable, 800) end
+        end
+    })
+    mainHandler.post(beepRunnable)
+end
+
+function stopProcessingSound()
+    beepActive = false
+    if beepRunnable then
+        pcall(function() mainHandler.removeCallbacks(beepRunnable) end)
+        beepRunnable = nil
+    end
+    if toneGen then
+        pcall(function() toneGen.stopTone(); toneGen.release() end)
+        toneGen = nil
+    end
+end
+
+-- ==================== ACCESSIBILITY FOCUS & IMAGE CHECK ====================
+function getCurrentFocusedItem()
+    local n = nil
+    pcall(function()
+        local root = service.getRootInActiveWindow and service.getRootInActiveWindow() or nil
+        if root then
+            local f = root.findFocus(2)
+            if f then n = f end
+        end
+    end)
+    if n then return n end
+    pcall(function() if service.getFocusView then n = service.getFocusView() end end)
+    if n then return n end
+    pcall(function() if service.getCurrentNode then n = service.getCurrentNode() end end)
+    return n
+end
+
+local IMAGE_CLASS_HINTS = { "imageview", "imagebutton", "image", "picture", "photo", "avatar", "thumbnail", "icon" }
+
+function resolveTargetImage()
+    local focused = getCurrentFocusedItem()
+    if not focused then return nil end
+
+    local className = ""
+    pcall(function() className = string.lower(tostring(focused.getClassName() or "")) end)
+
+    if className:find("textview", 1, true) or className:find("layout", 1, true) or className:find("edittext", 1, true) then
+        return nil
+    end
+
+    local isImg = false
+    for _, hint in ipairs(IMAGE_CLASS_HINTS) do
+        if className:find(hint, 1, true) then isImg = true; break end
+    end
+
+    local rect = Rect()
+    pcall(function() focused.getBoundsInScreen(rect) end)
+    local w = rect.right - rect.left
+    local h = rect.bottom - rect.top
+
+    if isImg and w >= 64 and h >= 64 then
+        return {
+            bounds = { left = rect.left, top = rect.top, right = rect.right, bottom = rect.bottom }
+        }
+    end
+
+    return nil
+end
+
+function pathToBase64(imagePath)
+    if not imagePath or imagePath == "" then return nil end
+    local f = File_CLASS(imagePath)
+    if not f.exists() or not f.canRead() then return nil end
+    local options = BitmapFactory.Options()
+    options.inSampleSize = 2
+    local bmp = BitmapFactory.decodeFile(imagePath, options)
+    if not bmp then return nil end
+    local out = ByteArrayOutputStream()
+    bmp.compress(Bitmap.CompressFormat.JPEG, 60, out)
+    local bytes = out.toByteArray()
+    out.close()
+    pcall(function() bmp.recycle() end)
+    return Base64.encodeToString(bytes, Base64.NO_WRAP)
+end
+
+-- ==================== SCREEN CAPTURE & CROP ENGINE ====================
+function captureRegionAsBase64(bounds, callback)
+    local bv = luajava.bindClass("android.os.Build$VERSION")
+    if bv.SDK_INT < 30 then
+        callback(nil, "Screen capture requires Android 11 or higher.")
+        return
+    end
+    if not hasConsent() then
+        callback(nil, "Screen capture permission is not enabled in Settings.")
+        return
+    end
+
+    local done = { hit = false }
+    local timeoutRunnable = nil
+
+    local function finish(b64, err)
+        if done.hit then return end
+        done.hit = true
+        if timeoutRunnable then
+            pcall(function() mainHandler.removeCallbacks(timeoutRunnable) end)
+            timeoutRunnable = nil
+        end
+        runOnMain(function() callback(b64, err) end)
+    end
+
+    timeoutRunnable = Runnable({
+        run = function()
+            finish(nil, "Screenshot timed out (CSR did not return screen buffer in 5 seconds).")
+        end
+    })
+    mainHandler.postDelayed(timeoutRunnable, 5000)
+
+    local cbOk, cb = pcall(function()
+        return luajava.createProxy("android.accessibilityservice.AccessibilityService$TakeScreenshotCallback", {
+            onSuccess = function(res)
+                local ok, errObj = pcall(function()
+                    local hb = res.getHardwareBuffer()
+                    local cs = res.getColorSpace()
+                    local hw = Bitmap.wrapHardwareBuffer(hb, cs)
+                    if not hw then
+                        pcall(function() hb.close() end)
+                        finish(nil, "Failed to wrap hardware buffer.")
+                        return
+                    end
+
+                    local soft = hw.copy(Bitmap.Config.ARGB_8888, false)
+                    pcall(function() hw.recycle() end)
+                    pcall(function() hb.close() end)
+
+                    if not soft then
+                        finish(nil, "Failed to copy hardware bitmap to software memory.")
+                        return
+                    end
+
+                    local bmW, bmH = soft.getWidth(), soft.getHeight()
+                    local sw, sh = bmW, bmH
+                    pcall(function()
+                        local dm = ctx.getResources().getDisplayMetrics()
+                        sw, sh = dm.widthPixels, dm.heightPixels
+                    end)
+                    local scaleX, scaleY = bmW / sw, bmH / sh
+
+                    local rx, ry, rw, rh = 0, 0, bmW, bmH
+                    if bounds and bounds.left and bounds.right then
+                        rx = math.max(0, math.min(math.floor(bounds.left * scaleX), bmW - 1))
+                        ry = math.max(0, math.min(math.floor(bounds.top * scaleY), bmH - 1))
+                        rw = math.max(1, math.min(math.floor((bounds.right - bounds.left) * scaleX), bmW - rx))
+                        rh = math.max(1, math.min(math.floor((bounds.bottom - bounds.top) * scaleY), bmH - ry))
+                    end
+
+                    local region = soft
+                    if rw < bmW or rh < bmH then
+                        pcall(function()
+                            local cropped = Bitmap.createBitmap(soft, rx, ry, rw, rh)
+                            if cropped then region = cropped end
+                        end)
+                    end
+
+                    local maxSide = math.max(region.getWidth(), region.getHeight())
+                    if maxSide > 800 then
+                        local scale = 800 / maxSide
+                        pcall(function()
+                            local scaled = Bitmap.createScaledBitmap(
+                                region,
+                                math.floor(region.getWidth() * scale),
+                                math.floor(region.getHeight() * scale),
+                                true
+                            )
+                            if scaled then region = scaled end
+                        end)
+                    end
+
+                    local baos = ByteArrayOutputStream()
+                    region.compress(Bitmap.CompressFormat.JPEG, 60, baos)
+                    local b64 = Base64.encodeToString(baos.toByteArray(), Base64.NO_WRAP)
+                    baos.close()
+
+                    pcall(function() if region ~= soft then region.recycle() end end)
+                    pcall(function() soft.recycle() end)
+
+                    finish(b64, nil)
+                end)
+                if not ok then
+                    finish(nil, "Image processing error: " .. tostring(errObj))
+                end
+            end,
+            onFailure = function(code)
+                finish(nil, "Android rejected screenshot with error code: " .. tostring(code))
+            end
+        })
+    end)
+
+    if not cbOk or not cb then
+        finish(nil, "Could not create screenshot callback proxy.")
+        return
+    end
+
+    local executor = nil
+    pcall(function() executor = ctx.getMainExecutor() end)
+    if not executor then
+        pcall(function()
+            executor = luajava.createProxy("java.util.concurrent.Executor", {
+                execute = function(r) runOnMain(function() r.run() end) end
+            })
+        end)
+    end
+
+    mainHandler.post(Runnable({
+        run = function()
+            local callOk, callErr = pcall(function()
+                service.takeScreenshot(0, executor, cb)
+            end)
+            if not callOk then
+                finish(nil, "takeScreenshot failed to launch: " .. tostring(callErr))
+            end
+        end
+    }))
+end
+
+-- ==================== TEXT CLEANING & OCR PARSERS ====================
+function cleanAIText(t)
+    if not t then return t end
+    local s = tostring(t)
+    s = s:gsub("<think>.-</think>", "")
+    s = s:gsub("%*", ""):gsub("`", ""):gsub("#+%s*", ""):gsub("_", "")
+    return s:match("^%s*(.-)%s*$") or s
+end
+
+function parseDescriptionAndExtractedText(rawText)
+    local s = tostring(rawText or "")
+    local descPart = s
+    local textPart = "No text found in image."
+
+    local splitPos = s:find("EXTRACTED_TEXT:", 1, true)
+    if not splitPos then
+        splitPos = s:find("Extracted Text:", 1, true)
+    end
+
+    if splitPos then
+        descPart = s:sub(1, splitPos - 1)
+        textPart = s:sub(splitPos):gsub("^[Ee][Xx][Tt][Rr][Aa][Cc][Tt][Ee][Dd]_[Tt][Ee][Xx][Tt]:%s*", ""):gsub("^[Ee]xtracted [Tt]ext:%s*", "")
+    end
+
+    descPart = descPart:gsub("^[Dd][Ee][Ss][Cc][Rr][Ii][Pp][Tt][Ii][Oo][Nn]:%s*", ""):gsub("^[Dd]escription:%s*", "")
+    descPart = descPart:match("^%s*(.-)%s*$") or ""
+    textPart = textPart:match("^%s*(.-)%s*$") or ""
+
+    if descPart == "" then descPart = s end
+    if textPart == "" or textPart:lower() == "none" or textPart:lower() == "none." or textPart:lower() == "n/a" then
+        textPart = "No text found in image."
+    end
+
+    return descPart, textPart
+end
+
+function splitTextIntoListItems(text)
+    local items = {}
+    local raw = tostring(text or "")
+    for line in raw:gmatch("[^\r\n]+") do
+        local cleanLine = line:match("^%s*(.-)%s*$")
+        if cleanLine and cleanLine ~= "" then
+            local buffer = ""
+            for i = 1, #cleanLine do
+                local ch = cleanLine:sub(i, i)
+                buffer = buffer .. ch
+                if ch == "." or ch == "!" or ch == "?" then
+                    local nextCh = cleanLine:sub(i + 1, i + 1)
+                    if nextCh == "" or nextCh == " " then
+                        local trimmed = buffer:match("^%s*(.-)%s*$")
+                        if trimmed ~= "" then table.insert(items, trimmed) end
+                        buffer = ""
+                    end
+                end
+            end
+            local rem = buffer:match("^%s*(.-)%s*$")
+            if rem and rem ~= "" then
+                table.insert(items, rem)
+            end
+        end
+    end
+    if #items == 0 then
+        table.insert(items, raw ~= "" and raw or "(No text)")
+    end
+    return items
+end
+
+-- ==================== HTTP HELPERS ====================
+function safeHttpPost(url, payload, headers, callback)
+    local posted = pcall(function()
+        Http.post(url, payload, nil, headers, callback)
+    end)
+    if not posted then
+        local posted4, err4 = pcall(function()
+            Http.post(url, payload, headers, callback)
+        end)
+        if not posted4 then
+            runOnMain(function() callback(-1, "Http.post error: " .. tostring(err4)) end)
+        end
+    end
+end
+
+function safeHttpGet(url, headers, callback)
+    local got = pcall(function()
+        Http.get(url, nil, nil, headers, callback)
+    end)
+    if not got then
+        local got3 = pcall(function()
+            Http.get(url, headers, callback)
+        end)
+        if not got3 then
+            pcall(function() Http.get(url, callback) end)
+        end
+    end
+end
+
+-- ==================== LIVE MODEL DISCOVERY ====================
+function fetchLiveGroqModels(apiKey, isVision, callback)
+    local headers = HashMap()
+    headers.put("Authorization", "Bearer " .. apiKey)
+    safeHttpGet("https://api.groq.com/openai/v1/models", headers, function(status, data)
+        local discovered = {}
+        if status == 200 and data then
+            pcall(function()
+                local dec = cjson.decode(tostring(data))
+                if dec and dec.data then
+                    for _, item in ipairs(dec.data) do
+                        local id = tostring(item.id or "")
+                        local low = id:lower()
+                        if not low:find("whisper") and not low:find("tts") and not low:find("orpheus") and not low:find("guard") then
+                            if isVision then
+                                if low:find("qwen3%.8") or low:find("vision") or low:find("scout") or low:find("maverick") or low:find("pixtral") or low:find("llava") then
+                                    table.insert(discovered, 1, id)
+                                else
+                                    table.insert(discovered, id)
+                                end
+                            else
+                                table.insert(discovered, id)
+                            end
+                        end
+                    end
+                end
+            end)
+        end
+        callback(discovered)
+    end)
+end
+
+-- ==================== GROQ AI ENGINE ====================
+function callGroqAI(apiKey, modelSequence, promptText, base64Image, conversationHistory, callback)
+    local idx = 1
+    local lastErr = "Request failed"
+    local triedLiveDiscovery = false
+    local baseUrl = "https://api.groq.com/openai/v1/chat/completions"
+
+    local function tryNext()
+        if idx > #modelSequence then
+            if not triedLiveDiscovery then
+                triedLiveDiscovery = true
+                fetchLiveGroqModels(apiKey, base64Image ~= nil, function(liveList)
+                    if #liveList > 0 then
+                        for _, lm in ipairs(liveList) do
+                            local exists = false
+                            for _, em in ipairs(modelSequence) do
+                                if em == lm then exists = true; break end
+                            end
+                            if not exists then table.insert(modelSequence, lm) end
+                        end
+                        tryNext()
+                    else
+                        runOnMain(function() callback(nil, lastErr) end)
+                    end
+                end)
+                return
+            end
+            runOnMain(function() callback(nil, lastErr) end)
+            return
+        end
+
+        local modelId = modelSequence[idx]
+        idx = idx + 1
+
+        local messages = {}
+        if conversationHistory and #conversationHistory > 0 then
+            for _, msg in ipairs(conversationHistory) do
+                table.insert(messages, msg)
+            end
+        else
+            local contentVal
+            if base64Image then
+                contentVal = {
+                    { type = "text", text = promptText },
+                    { type = "image_url", image_url = { url = "data:image/jpeg;base64," .. base64Image } }
+                }
+            else
+                contentVal = promptText
+            end
+            table.insert(messages, { role = "user", content = contentVal })
+        end
+
+        local payload = cjson.encode({
+            model = modelId,
+            messages = messages,
+            max_tokens = 600
+        })
+
+        local headers = HashMap()
+        headers.put("Content-Type", "application/json")
+        headers.put("Authorization", "Bearer " .. apiKey)
+
+        safeHttpPost(baseUrl, payload, headers, function(status, data)
+            local body = tostring(data or "")
+            if status == 200 then
+                local ok, dec = pcall(cjson.decode, body)
+                if ok and dec and dec.choices and dec.choices[1] then
+                    local content = dec.choices[1].message and dec.choices[1].message.content
+                    if content then
+                        runOnMain(function() callback(cleanAIText(content), nil) end)
+                        return
+                    end
+                end
+                lastErr = "Empty response from Groq."
+                tryNext()
+            elseif status == 400 or status == 404 or status == 429 or status == 503 then
+                local errMsg = "HTTP Error " .. tostring(status)
+                local ok, dec = pcall(cjson.decode, body)
+                if ok and dec and dec.error and dec.error.message then
+                    errMsg = errMsg .. ": " .. tostring(dec.error.message)
+                end
+                lastErr = errMsg
+                tryNext()
+            else
+                local msg = "HTTP Error " .. tostring(status)
+                local ok, dec = pcall(cjson.decode, body)
+                if ok and dec and dec.error and dec.error.message then
+                    msg = msg .. ": " .. tostring(dec.error.message)
+                end
+                runOnMain(function() callback(nil, msg) end)
+            end
+        end)
+    end
+
+    tryNext()
+end
+
+function askGroqWithHistory(promptText, base64Image, history, callback)
+    local key = getGroqApiKey()
+    if not key or key == "" then
+        callback(nil, "Groq API key is missing. Get a free key at console.groq.com and paste it in Settings.")
+        return
+    end
+    local chosen = groqModelIds[getGroqModel()] or "qwen/qwen3.8-27b"
+    local seq = { chosen }
+    for _, m in ipairs(GROQ_FALLBACK_ORDER) do
+        if m ~= chosen then table.insert(seq, m) end
+    end
+    callGroqAI(key, seq, promptText, base64Image, history, callback)
+end
+-- [END OF PART 1 - PASTE PART 2 DIRECTLY BELOW THIS LINE]
+-- [START OF PART 2 - PASTE DIRECTLY BELOW PART 1]
+
+-- ==================== RESTORED INTERACTIVE RESULT DIALOG ====================
+function showInteractiveResultDialog(title, rawResultText, base64Image)
+    runOnMain(function()
+        local visualDesc, extractedText = parseDescriptionAndExtractedText(rawResultText)
+
+        local chatHistory = {}
+        local initialPromptContent = {
+            { type = "text", text = "Describe what you see in this image." },
+            { type = "image_url", image_url = { url = "data:image/jpeg;base64," .. base64Image } }
+        }
+        table.insert(chatHistory, { role = "user", content = initialPromptContent })
+        table.insert(chatHistory, { role = "assistant", content = rawResultText })
+
+        local rootLayout = LinearLayout(ctx)
+        rootLayout.setOrientation(1)
+        rootLayout.setPadding(30, 15, 30, 15)
+        rootLayout.setBackgroundColor(LIGHT_BLUE)
+
+        local mainScroll = ScrollView(ctx)
+        local contentLayout = LinearLayout(ctx)
+        contentLayout.setOrientation(1)
+
+        -- 1. Visual Image Description Section
+        local descLabel = TextView(ctx)
+        descLabel.setText("Image Description")
+        descLabel.setTextSize(15)
+        descLabel.setTextColor(0xFF000000)
+        pcall(function() descLabel.setTypeface(nil, Typeface.BOLD) end)
+        contentLayout.addView(descLabel)
+
+        local descItems = splitTextIntoListItems(visualDesc)
+        local lvDesc = ListView(ctx)
+        lvDesc.setAdapter(ArrayAdapter(ctx, android.R.layout.simple_list_item_1, descItems))
+        lvDesc.setLayoutParams(LinearLayout.LayoutParams(-1, 210))
+        contentLayout.addView(lvDesc)
+
+        local divider1 = View(ctx)
+        divider1.setLayoutParams(LinearLayout.LayoutParams(-1, 2))
+        divider1.setBackgroundColor(0xFF888888)
+        contentLayout.addView(divider1)
+
+        -- 2. Classified Extracted Text Section
+        local textLabel = TextView(ctx)
+        textLabel.setText("Extracted Text in Image")
+        textLabel.setTextSize(15)
+        textLabel.setTextColor(0xFF000000)
+        textLabel.setPadding(0, 6, 0, 0)
+        pcall(function() textLabel.setTypeface(nil, Typeface.BOLD) end)
+        contentLayout.addView(textLabel)
+
+        local extractedItems = splitTextIntoListItems(extractedText)
+        local lvExtracted = ListView(ctx)
+        lvExtracted.setAdapter(ArrayAdapter(ctx, android.R.layout.simple_list_item_1, extractedItems))
+        lvExtracted.setLayoutParams(LinearLayout.LayoutParams(-1, 140))
+        contentLayout.addView(lvExtracted)
+
+        local divider2 = View(ctx)
+        divider2.setLayoutParams(LinearLayout.LayoutParams(-1, 2))
+        divider2.setBackgroundColor(0xFF888888)
+        contentLayout.addView(divider2)
+
+        -- 3. Questions Section
+        local ansLabel = TextView(ctx)
+        ansLabel.setText("Questions")
+        ansLabel.setTextSize(15)
+        ansLabel.setTextColor(0xFF000000)
+        ansLabel.setPadding(0, 6, 0, 0)
+        pcall(function() ansLabel.setTypeface(nil, Typeface.BOLD) end)
+        contentLayout.addView(ansLabel)
+
+        local currentAnswerText = "(No questions asked yet)"
+        local ansItems = { currentAnswerText }
+        local lvAnswer = ListView(ctx)
+        lvAnswer.setAdapter(ArrayAdapter(ctx, android.R.layout.simple_list_item_1, ansItems))
+        lvAnswer.setLayoutParams(LinearLayout.LayoutParams(-1, 160))
+        contentLayout.addView(lvAnswer)
+
+        local qInput = EditText(ctx)
+        qInput.setHint("Type your question here...")
+        qInput.setTextSize(14)
+        qInput.setTextColor(0xFF000000)
+        contentLayout.addView(qInput)
+
+        local btnRow = LinearLayout(ctx)
+        btnRow.setOrientation(0)
+        btnRow.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+
+        local btnSend = Button(ctx)
+        btnSend.setText("Send Question")
+        btnSend.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
+        btnSend.setBackgroundColor(0xFF4CAF50)
+        btnSend.setTextColor(0xFFFFFFFF)
+        btnRow.addView(btnSend)
+
+        local btnVoice = Button(ctx)
+        btnVoice.setText("馃帳 Voice Question")
+        btnVoice.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
+        btnVoice.setBackgroundColor(0xFF2196F3)
+        btnVoice.setTextColor(0xFFFFFFFF)
+        btnRow.addView(btnVoice)
+
+        contentLayout.addView(btnRow)
+        mainScroll.addView(contentLayout)
+        rootLayout.addView(mainScroll)
+
+        local dlg = LuaDialog(ctx)
+        dlg.setTitle(title)
+        dlg.setView(rootLayout)
+        dlg.setPositiveButton("Close", nil)
+        dlg.setNeutralButton("Copy", function()
+            pcall(function()
+                local copyText = "Image Description:\n" .. tostring(visualDesc) ..
+                                 "\n\nExtracted Text in Image:\n" .. tostring(extractedText) ..
+                                 "\n\nQuestions:\n" .. tostring(currentAnswerText)
+                ctx.getSystemService(Context.CLIPBOARD_SERVICE).setText(copyText)
+                notify("Copied to clipboard")
+            end)
+        end)
+        dlg.show()
+        applyLightBlue(dlg)
+
+        local function updateQuestionAnswerList(questionText, answerText)
+            local listData = {}
+            table.insert(listData, "Question: " .. tostring(questionText))
+            local answerLines = splitTextIntoListItems(answerText)
+            for idx, line in ipairs(answerLines) do
+                if idx == 1 then
+                    table.insert(listData, "Answer: " .. line)
+                else
+                    table.insert(listData, line)
+                end
+            end
+            currentAnswerText = "Question: " .. tostring(questionText) .. "\nAnswer: " .. tostring(answerText)
+            lvAnswer.setAdapter(ArrayAdapter(ctx, android.R.layout.simple_list_item_1, listData))
+        end
+
+        local function executeQuestion(qText)
+            if not qText or qText == "" then
+                notify("Please type or enter a question.")
+                return
+            end
+            notify("Processing your question...")
+            startProcessingSound()
+
+            local lang = getSelectedLanguage()
+            local langRule = LANGUAGE_INSTRUCTIONS[lang] or ("Answer in " .. tostring(lang) .. ".")
+            local specificPrompt = "User Question: " .. qText .. "\n\n" ..
+                                   "Instructions:\n" ..
+                                   "1. Answer ONLY this specific question directly and concisely.\n" ..
+                                   "2. Do NOT repeat the full image description.\n" ..
+                                   "3. " .. langRule .. "\n" ..
+                                   "4. Write each point on a new line without markdown or asterisks."
+
+            table.insert(chatHistory, { role = "user", content = specificPrompt })
+
+            askGroqWithHistory(specificPrompt, nil, chatHistory, function(answer, err)
+                stopProcessingSound()
+                if answer then
+                    table.insert(chatHistory, { role = "assistant", content = answer })
+                    updateQuestionAnswerList(qText, answer)
+                    qInput.setText("")
+                    notify("Answer received")
+                    pcall(function() if service and service.speak then service.speak(answer) end end)
+                else
+                    local errStr = tostring(err or "Failed to get answer")
+                    updateQuestionAnswerList(qText, "Error: " .. errStr)
+                    notify(errStr)
+                end
+            end)
+        end
+
+        btnSend.onClick = function()
+            executeQuestion(tostring(qInput.getText()))
+        end
+
+        local recognizer = nil
+        local function stopVoice()
+            pcall(function()
+                if recognizer then
+                    recognizer.cancel()
+                    recognizer.destroy()
+                    recognizer = nil
+                end
+            end)
+        end
+
+        btnVoice.onClick = function()
+            runOnMain(function()
+                local okAvail, isAvail = pcall(function()
+                    return SpeechRecognizer.isRecognitionAvailable(ctx)
+                end)
+                if okAvail and not isAvail then
+                    notify("Speech recognition is not available on this device.")
+                    return
+                end
+
+                stopVoice()
+
+                local okRec, rec = pcall(function()
+                    return SpeechRecognizer.createSpeechRecognizer(ctx)
+                end)
+                if not okRec or not rec then
+                    notify("Failed to create SpeechRecognizer.")
+                    return
+                end
+                recognizer = rec
+
+                local listenerOk, listener = pcall(function()
+                    return luajava.createProxy("android.speech.RecognitionListener", {
+                        onReadyForSpeech = function(params)
+                            runOnMain(function()
+                                playSingleBeep()
+                                notify("Listening, speak now")
+                            end)
+                        end,
+                        onBeginningOfSpeech = function() end,
+                        onRmsChanged = function(rmsdB) end,
+                        onBufferReceived = function(buffer) end,
+                        onEndOfSpeech = function() end,
+                        onPartialResults = function(partialResults) end,
+                        onEvent = function(eventType, params) end,
+                        onError = function(error)
+                            runOnMain(function()
+                                stopVoice()
+                                local errCode = tonumber(error) or 0
+                                if errCode == 11 then
+                                    notify("Speech recognizer is busy. Please try again.")
+                                else
+                                    notify("Speech recognition error code: " .. tostring(error))
+                                end
+                            end)
+                        end,
+                        onResults = function(results)
+                            runOnMain(function()
+                                local text = ""
+                                pcall(function()
+                                    if results then
+                                        local matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                                        if matches and matches.size() > 0 then
+                                            text = tostring(matches.get(0))
+                                        end
+                                    end
+                                end)
+                                stopVoice()
+                                if text and text ~= "" then
+                                    qInput.setText(text)
+                                    executeQuestion(text)
+                                else
+                                    notify("I did not hear anything. Please try again.")
+                                end
+                            end)
+                        end
+                    })
+                end)
+
+                if not listenerOk or not listener then
+                    stopVoice()
+                    notify("Failed to create RecognitionListener.")
+                    return
+                end
+
+                pcall(function() recognizer.setRecognitionListener(listener) end)
+
+                local langCode = "en-US"
+                local selLang = getSelectedLanguage()
+                if selLang == "Roman Urdu" or selLang == "Simple Urdu (丕乇丿賵)" then
+                    langCode = "ur-PK"
+                elseif selLang == "Arabic (丕賱毓乇亘賷丞)" then
+                    langCode = "ar-SA"
+                elseif selLang == "French (Fran莽ais)" then
+                    langCode = "fr-FR"
+                end
+
+                local intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, langCode)
+                intent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+
+                pcall(function() recognizer.startListening(intent) end)
+            end)
+        end
+    end)
+end
+
+function showSimpleDialog(title, text)
+    runOnMain(function()
+        local dlg = LuaDialog(ctx)
+        dlg.setTitle(title)
+        local tv = TextView(ctx)
+        tv.setText(tostring(text))
+        tv.setTextSize(14)
+        tv.setTextColor(0xFF000000)
+        tv.setPadding(30, 20, 30, 20)
+        dlg.setView(tv)
+        dlg.setPositiveButton("OK", nil)
+        dlg.show()
+        applyLightBlue(dlg)
+    end)
+end
+
+-- ==================== PROCESS FOCUSED IMAGE ====================
+function buildDescriptionPrompt()
+    local lang = getSelectedLanguage()
+    local langRule = LANGUAGE_INSTRUCTIONS[lang] or ("Answer in " .. tostring(lang) .. ".")
+    local lenChoice = getDescriptionLength()
+    local lenRule = LENGTH_INSTRUCTIONS[lenChoice] or LENGTH_INSTRUCTIONS["Medium"]
+    return "Analyze this image and reply in two clearly separated sections using these exact labels:\n\n" ..
+           "DESCRIPTION:\n" ..
+           lenRule .. " " .. langRule .. " Put each sentence on a new line. Do not read out full text blocks inside the visual description.\n\n" ..
+           "EXTRACTED_TEXT:\n" ..
+           "If there is any visible text written inside the image, write all of that text here clearly line by line. If there is no text in the image, write: No text found in image.\n" ..
+           "Do not use markdown or asterisks."
+end
+
+function processFocusedImage(target)
+    if isProcessing then
+        notify("Already processing, please wait")
+        return
+    end
+
+    isProcessing = true
+    startProcessingSound()
+    notify("Describing image...")
+
+    captureRegionAsBase64(target.bounds, function(b64, err)
+        if b64 then
+            local prompt = buildDescriptionPrompt()
+
+            askGroqWithHistory(prompt, b64, nil, function(res, apiErr)
+                stopProcessingSound()
+                isProcessing = false
+                local text = res or ("Error: " .. tostring(apiErr or "Request failed."))
+                showInteractiveResultDialog("Result & Chat (Groq)", text, b64)
+                local visualDesc, extractedText = parseDescriptionAndExtractedText(text)
+                local spokenText = visualDesc
+                if extractedText ~= "No text found in image." then
+                    spokenText = spokenText .. ". Extracted text: " .. extractedText
+                end
+                pcall(function() if service and service.speak then service.speak(spokenText) end end)
+            end)
+        else
+            stopProcessingSound()
+            isProcessing = false
+            local errMsg = tostring(err or "Could not capture screen.")
+            notify(errMsg)
+            showSimpleDialog("Capture Failed", errMsg .. "\n\nTip: You can also use 'Choose from Gallery' in the main menu.")
+        end
+    end)
+end
+
+-- ==================== SETTINGS DIALOG ====================
+function showSettingsDialog()
+    runOnMain(function()
+        local root = LinearLayout(ctx)
+        root.setOrientation(1)
+        root.setPadding(40, 30, 40, 20)
+        root.setBackgroundColor(LIGHT_BLUE)
+
+        local groqLabel = TextView(ctx)
+        groqLabel.setText("Groq API Key (Free at console.groq.com):")
+        groqLabel.setTextColor(0xFF000000)
+        root.addView(groqLabel)
+
+        local groqInput = EditText(ctx)
+        groqInput.setHint("Paste Groq API key (gsk_...)")
+        groqInput.setText(getGroqApiKey())
+        groqInput.setTextColor(0xFF000000)
+        root.addView(groqInput)
+
+        local groqModLabel = TextView(ctx)
+        groqModLabel.setText("Select Groq Vision Model:")
+        groqModLabel.setTextColor(0xFF000000)
+        groqModLabel.setPadding(0, 10, 0, 5)
+        root.addView(groqModLabel)
+
+        local groqSpinner = Spinner(ctx)
+        groqSpinner.setAdapter(ArrayAdapter(ctx, android.R.layout.simple_spinner_item, GROQ_MODELS))
+        for i = 1, #GROQ_MODELS do
+            if GROQ_MODELS[i] == getGroqModel() then groqSpinner.setSelection(i - 1); break end
+        end
+        root.addView(groqSpinner)
+
+        local langLabel = TextView(ctx)
+        langLabel.setText("Select Language (For Description & Questions):")
+        langLabel.setTextColor(0xFF000000)
+        langLabel.setPadding(0, 15, 0, 5)
+        root.addView(langLabel)
+
+        local langSpinner = Spinner(ctx)
+        langSpinner.setAdapter(ArrayAdapter(ctx, android.R.layout.simple_spinner_item, LANGUAGES))
+        local curLang = getSelectedLanguage()
+        for i = 1, #LANGUAGES do
+            if LANGUAGES[i] == curLang then langSpinner.setSelection(i - 1); break end
+        end
+        root.addView(langSpinner)
+
+        local lenLabel = TextView(ctx)
+        lenLabel.setText("Select Description Length:")
+        lenLabel.setTextColor(0xFF000000)
+        lenLabel.setPadding(0, 15, 0, 5)
+        root.addView(lenLabel)
+
+        local lenSpinner = Spinner(ctx)
+        lenSpinner.setAdapter(ArrayAdapter(ctx, android.R.layout.simple_spinner_item, DESCRIPTION_LENGTHS))
+        local curLen = getDescriptionLength()
+        for i = 1, #DESCRIPTION_LENGTHS do
+            if DESCRIPTION_LENGTHS[i] == curLen then lenSpinner.setSelection(i - 1); break end
+        end
+        root.addView(lenSpinner)
+
+        local btnTestKey = Button(ctx)
+        btnTestKey.setText("Test Groq API Key")
+        btnTestKey.setBackgroundColor(0xFF2196F3)
+        btnTestKey.setTextColor(0xFFFFFFFF)
+        root.addView(btnTestKey)
+
+        local capHeading = TextView(ctx)
+        capHeading.setText("Screen Capture Permission")
+        capHeading.setTextSize(16)
+        capHeading.setTextColor(0xFF000000)
+        capHeading.setPadding(0, 20, 0, 10)
+        pcall(function() capHeading.setTypeface(nil, Typeface.BOLD) end)
+        root.addView(capHeading)
+
+        local consentCheck = CheckBox(ctx)
+        consentCheck.setText("Allow screen capture")
+        consentCheck.setChecked(hasConsent())
+        consentCheck.setTextColor(0xFF000000)
+        root.addView(consentCheck)
+
+        local btnTestCap = Button(ctx)
+        btnTestCap.setText("Run Test Capture")
+        btnTestCap.setBackgroundColor(0xFF2196F3)
+        btnTestCap.setTextColor(0xFFFFFFFF)
+        root.addView(btnTestCap)
+
+        local btnSave = Button(ctx)
+        btnSave.setText("Save Settings")
+        btnSave.setBackgroundColor(0xFF4CAF50)
+        btnSave.setTextColor(0xFFFFFFFF)
+        root.addView(btnSave)
+
+        local btnClose = Button(ctx)
+        btnClose.setText("Close")
+        root.addView(btnClose)
+
+        local scroll = ScrollView(ctx)
+        scroll.setBackgroundColor(LIGHT_BLUE)
+        scroll.addView(root)
+
+        local dlg = LuaDialog(ctx)
+        dlg.setTitle("Settings & Permissions")
+        dlg.setView(scroll)
+        dlg.show()
+        applyLightBlue(dlg)
+
+        consentCheck.setOnCheckedChangeListener(CompoundButton.OnCheckedChangeListener{
+            onCheckedChanged = function(_, isChecked)
+                setConsent(isChecked)
+                notify(isChecked and "Screen capture allowed" or "Screen capture disallowed")
+            end
+        })
+
+        local function saveAllCurrentInputs()
+            saveGroqApiKey(tostring(groqInput.getText()))
+            saveGroqModel(GROQ_MODELS[groqSpinner.getSelectedItemPosition() + 1])
+            saveSelectedLanguage(LANGUAGES[langSpinner.getSelectedItemPosition() + 1])
+            saveDescriptionLength(DESCRIPTION_LENGTHS[lenSpinner.getSelectedItemPosition() + 1])
+        end
+
+        btnTestKey.onClick = function()
+            saveAllCurrentInputs()
+            notify("Testing Groq API key...")
+            startProcessingSound()
+            askGroqWithHistory("Reply with the single word OK", nil, nil, function(res, err)
+                stopProcessingSound()
+                if res then
+                    showSimpleDialog("API Key Valid!", "Groq responded: " .. tostring(res))
+                else
+                    showSimpleDialog("API Test Failed", tostring(err))
+                end
+            end)
+        end
+
+        btnTestCap.onClick = function()
+            if not hasConsent() then notify("Please check 'Allow screen capture' first."); return end
+            notify("Testing screen capture...")
+            startProcessingSound()
+            captureRegionAsBase64({ left = 0, top = 0, right = 400, bottom = 400 }, function(b64, err)
+                stopProcessingSound()
+                if b64 then
+                    showSimpleDialog("Test Success", "Screen capture works properly!")
+                else
+                    showSimpleDialog("Test Failed", "Reason: " .. tostring(err))
+                end
+            end)
+        end
+
+        btnSave.onClick = function()
+            saveAllCurrentInputs()
+            notify("Settings saved (" .. getSelectedLanguage() .. ", " .. getDescriptionLength() .. ")")
+            pcall(function() dlg.dismiss() end)
+        end
+
+        btnClose.onClick = function() pcall(function() dlg.dismiss() end) end
+    end)
+end
+
+-- ==================== GALLERY SCANNER ====================
+function scanAllImages()
+    notify("Scanning gallery...")
+    local found = {}
+    local cr = ctx.getContentResolver()
+    local uri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+    local proj = { MediaStore.Images.Media.DATA, MediaStore.Images.Media.DISPLAY_NAME }
+    local c = cr.query(uri, proj, nil, nil, MediaStore.Images.Media.DATE_ADDED .. " DESC")
+    if c ~= nil then
+        local dcol = c.getColumnIndexOrThrow(MediaStore.Images.Media.DATA)
+        local ncol = c.getColumnIndexOrThrow(MediaStore.Images.Media.DISPLAY_NAME)
+        while c.moveToNext() do
+            local p = c.getString(dcol)
+            local n = c.getString(ncol)
+            if p and n then table.insert(found, {path = p, name = n}) end
+        end
+        c.close()
+    end
+    if #found > 0 then
+        runOnMain(function()
+            local data = {}
+            photoFilePaths = {}
+            for _, f in ipairs(found) do table.insert(data, f.name); table.insert(photoFilePaths, f.path) end
+            local lv = ListView(ctx)
+            lv.setAdapter(ArrayAdapter(ctx, android.R.layout.simple_list_item_1, data))
+            local ld = LuaDialog(ctx)
+            ld.setTitle("Select Image")
+            ld.setView(lv)
+            ld.show()
+            applyLightBlue(ld)
+            lv.setOnItemClickListener(AdapterView.OnItemClickListener{
+                onItemClick = function(p, v, pos, id)
+                    selectedPhotoPath = photoFilePaths[pos + 1]
+                    if _G.statusLabel then _G.statusLabel.setText("Selected: " .. File_CLASS(selectedPhotoPath).getName()) end
+                    notify("Selected: " .. File_CLASS(selectedPhotoPath).getName())
+                    ld.dismiss()
+                end
+            })
+        end)
+    else
+        showSimpleDialog("Gallery", "No images found.")
+    end
+end
+
+-- ==================== ABOUT & FEEDBACK (MAMOON) ====================
+local DEVELOPER_PHONE = "923145993946"
+local YOUTUBE_CHANNEL_URL = "https://www.youtube.com/@instructor-of-BTW"
+local WHATSAPP_COMMUNITY_URL = "https://chat.whatsapp.com/CDkyuCcPVyEIAkW87j644n"
+
+local MediaRecorderClass = nil
+pcall(function() MediaRecorderClass = luajava.bindClass("android.media.MediaRecorder") end)
+
+local GradientDrawableClass = nil
+pcall(function() GradientDrawableClass = luajava.bindClass("android.graphics.drawable.GradientDrawable") end)
+
+local function makeBoxDrawable(bgColorInt, radiusPx, strokeWidthPx, strokeColorInt)
+    local drawable = nil
+    pcall(function()
+        if GradientDrawable then
+            drawable = GradientDrawable()
+        elseif GradientDrawableClass then
+            drawable = GradientDrawableClass()
+        end
+    end)
+    if not drawable then return ColorDrawable(bgColorInt or 0xFF161F30) end
+    pcall(function()
+        drawable.setColor(bgColorInt)
+        drawable.setCornerRadius(radiusPx or 16)
+        if strokeWidthPx and strokeColorInt then
+            drawable.setStroke(strokeWidthPx, strokeColorInt)
+        end
+    end)
+    return drawable
+end
+
+local function getPublicAudioFeedbackFile()
+    local targetDir = "/storage/emulated/0/Download"
+    pcall(function()
+        local pubDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        if pubDir and pubDir.exists() then
+            targetDir = pubDir.getAbsolutePath()
+        end
+    end)
+    return File(tostring(targetDir), "image_recogniser_feedback.m4a")
+end
+
+local activeAboutDialog = nil
+local activeChoiceDialog = nil
+local activeTextDialog = nil
+local activeVoiceDialog = nil
+
+local function closeAllExtensionDialogs()
+    pcall(function() if activeVoiceDialog then activeVoiceDialog.dismiss() end end)
+    pcall(function() if activeTextDialog then activeTextDialog.dismiss() end end)
+    pcall(function() if activeChoiceDialog then activeChoiceDialog.dismiss() end end)
+    pcall(function() if activeAboutDialog then activeAboutDialog.dismiss() end end)
+    pcall(function() if currentAboutDlg then currentAboutDlg.dismiss() end end)
+    pcall(function() if mainDlg then mainDlg.dismiss() end end)
+end
+
+local function openExternalWebUrl(targetUrl)
+    closeAllExtensionDialogs()
+    pcall(function()
+        local intent = Intent(Intent.ACTION_VIEW)
+        intent.setData(Uri.parse(targetUrl))
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ctx.startActivity(intent)
+    end)
+end
+
+local IMAGE_RECOGNISER_DESCRIPTION = [[
+Pro Image Recogniser
+Created by: Mamoon (Mamoon Abdullah)
+Platform: Commentary Screen Reader (CSR / Jieshuo)
+
+OVERVIEW:
+Pro Image Recogniser is an advanced visual accessibility tool built specifically for blind and visually impaired users. It provides instant scene analysis, on-screen image inspection, local gallery photo reading, text extraction (OCR), and conversational follow-up questions.
+
+KEY FUNCTIONALITY:
+
+1. Focused Screen Image Capture:
+- Automatically detects focused ImageViews, ImageButtons, icons, and visual elements on screen.
+- Uses Android 11+ accessibility screen capture to crop and isolate only the target image, avoiding background clutter.
+
+2. Gallery Photo Scanner:
+- Scans device storage via MediaStore and displays recent images in an accessible list for single-tap AI analysis.
+
+3. Groq Vision AI Engine:
+- Employs high-speed vision models (Qwen 3.8 27B Vision and Llama 4 Scout Vision).
+- Features automatic fallback routing and live model discovery to prevent request failures.
+
+4. Screen Reader-Friendly Layout:
+- Image Description: Formatted line-by-line inside a ListView for smooth sentence-by-sentence swiping.
+- Extracted Text (OCR): Clean separation of visible text and signs found within images.
+- Follow-up Q&A: Interactive inquiry section supporting typed and spoken follow-up questions.
+
+5. Custom Preferences:
+- 5 Response Languages: English, Roman Urdu, Simple Urdu, Arabic, and French.
+- 3 Detail Levels: Small (2-3 sentences), Medium (4-6 sentences), and Large (in-depth analysis).
+
+6. Developer Feedback:
+- Integrated WhatsApp communication routing directly to +92 314 5993946 for both text reports and voice recordings.
+]]
+
+showTextFeedbackDialog = function()
+    local tfLayout = {
+        ScrollView,
+        layout_width = "fill",
+        layout_height = "wrap_content",
+        background = "#0B0F19",
+        {
+            LinearLayout,
+            orientation = "vertical",
+            layout_width = "fill",
+            layout_height = "wrap_content",
+            padding = "22dp",
+            gravity = "center_horizontal",
+            {
+                TextView,
+                text = "Send Text Feedback to Mamoon",
+                textSize = "20sp",
+                textColor = "#F8FAFC",
+                gravity = "center",
+                layout_width = "fill",
+                layout_marginBottom = "18dp"
+            },
+            {
+                EditText,
+                id = "edt_fb_name_field",
+                hint = "Enter Your Name",
+                textColor = "#FFFFFF",
+                padding = "14dp",
+                layout_width = "fill",
+                layout_height = "52dp",
+                layout_marginBottom = "12dp"
+            },
+            {
+                EditText,
+                id = "edt_fb_phone_field",
+                hint = "Enter Your Phone Number",
+                textColor = "#FFFFFF",
+                padding = "14dp",
+                layout_width = "fill",
+                layout_height = "52dp",
+                layout_marginBottom = "12dp"
+            },
+            {
+                EditText,
+                id = "edt_fb_msg_field",
+                hint = "Write your feedback, suggestion, or bug report...",
+                textColor = "#FFFFFF",
+                padding = "14dp",
+                layout_width = "fill",
+                layout_height = "130dp",
+                gravity = "top|left",
+                layout_marginBottom = "22dp"
+            },
+            {
+                Button,
+                id = "btn_fb_send_text_now",
+                text = "Send to WhatsApp",
+                textSize = "16sp",
+                layout_width = "fill",
+                layout_height = "52dp",
+                layout_marginBottom = "12dp"
+            },
+            {
+                Button,
+                id = "btn_fb_close_text_dlg",
+                text = "Cancel",
+                textSize = "16sp",
+                layout_width = "fill",
+                layout_height = "52dp"
+            }
+        }
+    }
+
+    activeTextDialog = LuaDialog(ctx)
+    activeTextDialog.View = loadlayout(tfLayout)
+
+    edt_fb_name_field.setHintTextColor(0xFF64748B)
+    edt_fb_phone_field.setHintTextColor(0xFF64748B)
+    edt_fb_msg_field.setHintTextColor(0xFF64748B)
+
+    edt_fb_name_field.setBackground(makeBoxDrawable(0xFF161F30, 14, 2, 0xFF334155))
+    edt_fb_phone_field.setBackground(makeBoxDrawable(0xFF161F30, 14, 2, 0xFF334155))
+    edt_fb_msg_field.setBackground(makeBoxDrawable(0xFF161F30, 14, 2, 0xFF334155))
+    edt_fb_phone_field.setInputType(3)
+
+    btn_fb_send_text_now.setBackground(makeBoxDrawable(0xFF047857, 18, 2, 0xFF10B981))
+    btn_fb_send_text_now.setTextColor(0xFFFFFFFF)
+    btn_fb_send_text_now.setTypeface(Typeface.DEFAULT_BOLD)
+
+    btn_fb_close_text_dlg.setBackground(makeBoxDrawable(0xFF111827, 18, 2, 0xFF475569))
+    btn_fb_close_text_dlg.setTextColor(0xFF94A3B8)
+
+    pcall(function() if service and service.speak then service.speak("Send Text Feedback to Mamoon") end end)
+
+    btn_fb_send_text_now.onClick = function()
+        local nameVal = tostring(edt_fb_name_field.getText()):match("^%s*(.-)%s*$")
+        local phoneVal = tostring(edt_fb_phone_field.getText()):match("^%s*(.-)%s*$")
+        local msgVal = tostring(edt_fb_msg_field.getText()):match("^%s*(.-)%s*$")
+
+        if nameVal == "" or phoneVal == "" or msgVal == "" then
+            notify("Please fill in your name, phone number, and message.")
+            return
+        end
+
+        local formattedMsg = "Assalam-o-Alaikum Mamoon,\n" ..
+            "*Feedback for Pro Image Recogniser*\n\n" ..
+            "*Name:* " .. nameVal .. "\n" ..
+            "*Contact:* " .. phoneVal .. "\n\n" ..
+            "*Message:*\n" .. msgVal
+
+        notify("Opening WhatsApp to send message...")
+        closeAllExtensionDialogs()
+
+        local directUri = "whatsapp://send?phone=" .. DEVELOPER_PHONE .. "&text=" .. Uri.encode(formattedMsg)
+        local intent = Intent(Intent.ACTION_VIEW, Uri.parse(directUri))
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+
+        local launched = false
+        pcall(function()
+            ctx.startActivity(intent)
+            launched = true
+        end)
+
+        if not launched then
+            local fallbackUrl = "https://api.whatsapp.com/send?phone=" .. DEVELOPER_PHONE .. "&text=" .. Uri.encode(formattedMsg)
+            local fallbackIntent = Intent(Intent.ACTION_VIEW, Uri.parse(fallbackUrl))
+            fallbackIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            pcall(function() ctx.startActivity(fallbackIntent) end)
+        end
+    end
+
+    btn_fb_close_text_dlg.onClick = function()
+        activeTextDialog.dismiss()
+    end
+
+    activeTextDialog.show()
+end
+
+showVoiceFeedbackDialog = function()
+    local audioFileObj = getPublicAudioFeedbackFile()
+    local isRecording = false
+    local isPaused = false
+    local recorderObj = nil
+
+    local vfLayout = {
+        ScrollView,
+        layout_width = "fill",
+        layout_height = "wrap_content",
+        background = "#0B0F19",
+        {
+            LinearLayout,
+            orientation = "vertical",
+            layout_width = "fill",
+            layout_height = "wrap_content",
+            padding = "22dp",
+            gravity = "center_horizontal",
+            {
+                TextView,
+                text = "Send Voice Feedback to Mamoon",
+                textSize = "20sp",
+                textColor = "#F8FAFC",
+                gravity = "center",
+                layout_width = "fill",
+                layout_marginBottom = "10dp"
+            },
+            {
+                TextView,
+                id = "txt_audio_rec_status",
+                text = "Ready to record voice feedback.",
+                textSize = "15sp",
+                textColor = "#F59E0B",
+                gravity = "center",
+                layout_width = "fill",
+                layout_marginBottom = "22dp"
+            },
+            {
+                Button,
+                id = "btn_audio_rec_toggle",
+                text = "Start Voice Recording",
+                textSize = "16sp",
+                layout_width = "fill",
+                layout_height = "52dp",
+                layout_marginBottom = "12dp"
+            },
+            {
+                Button,
+                id = "btn_audio_rec_discard",
+                text = "Discard Recording",
+                textSize = "16sp",
+                layout_width = "fill",
+                layout_height = "52dp",
+                layout_marginBottom = "12dp"
+            },
+            {
+                Button,
+                id = "btn_audio_rec_send_wa",
+                text = "Send Voice to WhatsApp",
+                textSize = "16sp",
+                layout_width = "fill",
+                layout_height = "52dp",
+                layout_marginBottom = "14dp"
+            },
+            {
+                Button,
+                id = "btn_audio_rec_cancel",
+                text = "Cancel",
+                textSize = "16sp",
+                layout_width = "fill",
+                layout_height = "52dp"
+            }
+        }
+    }
+
+    activeVoiceDialog = LuaDialog(ctx)
+    activeVoiceDialog.View = loadlayout(vfLayout)
+
+    txt_audio_rec_status.setTypeface(Typeface.DEFAULT_BOLD)
+
+    btn_audio_rec_toggle.setBackground(makeBoxDrawable(0xFF1E3A8A, 18, 2, 0xFF3B82F6))
+    btn_audio_rec_toggle.setTextColor(0xFFFFFFFF)
+    btn_audio_rec_toggle.setTypeface(Typeface.DEFAULT_BOLD)
+
+    btn_audio_rec_discard.setBackground(makeBoxDrawable(0xFF7F1D1D, 18, 2, 0xFFEF4444))
+    btn_audio_rec_discard.setTextColor(0xFFFFFFFF)
+
+    btn_audio_rec_send_wa.setBackground(makeBoxDrawable(0xFF047857, 18, 2, 0xFF10B981))
+    btn_audio_rec_send_wa.setTextColor(0xFFFFFFFF)
+    btn_audio_rec_send_wa.setTypeface(Typeface.DEFAULT_BOLD)
+
+    btn_audio_rec_cancel.setBackground(makeBoxDrawable(0xFF111827, 18, 2, 0xFF475569))
+    btn_audio_rec_cancel.setTextColor(0xFF94A3B8)
+
+    pcall(function() if service and service.speak then service.speak("Voice Feedback. Ready to record.") end end)
+
+    local function stopAndFreeRecorder()
+        if recorderObj then
+            pcall(function() recorderObj.stop() end)
+            pcall(function() recorderObj.release() end)
+            recorderObj = nil
+        end
+        isRecording = false
+        isPaused = false
+    end
+
+    btn_audio_rec_toggle.onClick = function()
+        if not isRecording then
+            pcall(function()
+                if audioFileObj.exists() then audioFileObj.delete() end
+                local parentDir = audioFileObj.getParentFile()
+                if parentDir and not parentDir.exists() then parentDir.mkdirs() end
+            end)
+
+            local recordSuccess, recordErr = pcall(function()
+                if MediaRecorder then
+                    recorderObj = MediaRecorder()
+                elseif MediaRecorderClass then
+                    recorderObj = MediaRecorderClass()
+                end
+                recorderObj.setAudioSource(1)
+                recorderObj.setOutputFormat(2)
+                recorderObj.setAudioEncoder(3)
+                recorderObj.setOutputFile(audioFileObj.getAbsolutePath())
+                recorderObj.prepare()
+                recorderObj.start()
+            end)
+
+            if recordSuccess then
+                isRecording = true
+                isPaused = false
+                btn_audio_rec_toggle.setText("Pause Recording")
+                txt_audio_rec_status.setText("Recording voice... Speak now.")
+                pcall(function() if service and service.speak then service.speak("Recording started. Speak now.") end end)
+            else
+                stopAndFreeRecorder()
+                txt_audio_rec_status.setText("Microphone access failed.")
+                notify("Microphone access failed. Please enable microphone permission in Settings.")
+            end
+        else
+            if not isPaused then
+                pcall(function() recorderObj.pause() end)
+                isPaused = true
+                btn_audio_rec_toggle.setText("Resume Recording")
+                txt_audio_rec_status.setText("Recording paused.")
+                pcall(function() if service and service.speak then service.speak("Recording paused.") end end)
+            else
+                pcall(function() recorderObj.resume() end)
+                isPaused = false
+                btn_audio_rec_toggle.setText("Pause Recording")
+                txt_audio_rec_status.setText("Recording voice... Speak now.")
+                pcall(function() if service and service.speak then service.speak("Recording resumed.") end end)
+            end
+        end
+    end
+
+    btn_audio_rec_discard.onClick = function()
+        stopAndFreeRecorder()
+        pcall(function()
+            if audioFileObj.exists() then audioFileObj.delete() end
+        end)
+        btn_audio_rec_toggle.setText("Start Voice Recording")
+        txt_audio_rec_status.setText("Recording discarded.")
+        pcall(function() if service and service.speak then service.speak("Recording discarded.") end end)
+    end
+
+    btn_audio_rec_send_wa.onClick = function()
+        if isRecording then stopAndFreeRecorder() end
+
+        if not audioFileObj.exists() or audioFileObj.length() <= 1024 then
+            notify("Voice note is empty. Please record your voice before sending.")
+            return
+        end
+
+        notify("Opening WhatsApp to send voice note to Mamoon...")
+
+        pcall(function()
+            local StrictMode = luajava.bindClass("android.os.StrictMode")
+            local VmPolicyBuilder = luajava.bindClass("android.os.StrictMode$VmPolicy$Builder")
+            StrictMode.setVmPolicy(VmPolicyBuilder().build())
+        end)
+
+        pcall(function() audioFileObj.setReadable(true, false) end)
+
+        local fileUri = Uri.fromFile(audioFileObj)
+        local targetJid = DEVELOPER_PHONE .. "@s.whatsapp.net"
+
+        local sendIntent = Intent(Intent.ACTION_SEND)
+        sendIntent.setType("audio/*")
+        sendIntent.putExtra(Intent.EXTRA_STREAM, fileUri)
+        sendIntent.putExtra("android.intent.extra.STREAM", fileUri)
+        sendIntent.putExtra("jid", targetJid)
+        sendIntent.putExtra(Intent.EXTRA_TEXT, "Assalam-o-Alaikum Mamoon, here is my voice feedback regarding Pro Image Recogniser.")
+        sendIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        sendIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        sendIntent.setPackage("com.whatsapp")
+
+        closeAllExtensionDialogs()
+
+        local launched = false
+        pcall(function()
+            ctx.startActivity(sendIntent)
+            launched = true
+        end)
+
+        if not launched then
+            sendIntent.setPackage("com.whatsapp.w4b")
+            pcall(function()
+                ctx.startActivity(sendIntent)
+                launched = true
+            end)
+        end
+
+        if not launched then
+            sendIntent.setPackage(nil)
+            local chooser = Intent.createChooser(sendIntent, "Send Voice Note")
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            pcall(function() ctx.startActivity(chooser) end)
+        end
+    end
+
+    btn_audio_rec_cancel.onClick = function()
+        if isRecording then stopAndFreeRecorder() end
+        activeVoiceDialog.dismiss()
+    end
+
+    activeVoiceDialog.show()
+end
+
+showFeedbackChoiceDialog = function()
+    local choiceLayout = {
+        ScrollView,
+        layout_width = "fill",
+        layout_height = "wrap_content",
+        background = "#0B0F19",
+        {
+            LinearLayout,
+            orientation = "vertical",
+            layout_width = "fill",
+            layout_height = "wrap_content",
+            padding = "22dp",
+            gravity = "center_horizontal",
+            {
+                TextView,
+                text = "Contact Mamoon (Developer)",
+                textSize = "21sp",
+                textColor = "#F8FAFC",
+                gravity = "center",
+                layout_width = "fill",
+                layout_marginBottom = "20dp"
+            },
+            {
+                Button,
+                id = "btn_pick_text_feedback",
+                text = "Text Feedback (WhatsApp)",
+                textSize = "16sp",
+                layout_width = "fill",
+                layout_height = "52dp",
+                layout_marginBottom = "14dp"
+            },
+            {
+                Button,
+                id = "btn_pick_voice_feedback",
+                text = "Voice Feedback (WhatsApp)",
+                textSize = "16sp",
+                layout_width = "fill",
+                layout_height = "52dp",
+                layout_marginBottom = "16dp"
+            },
+            {
+                Button,
+                id = "btn_pick_cancel_feedback",
+                text = "Cancel",
+                textSize = "16sp",
+                layout_width = "fill",
+                layout_height = "52dp"
+            }
+        }
+    }
+
+    activeChoiceDialog = LuaDialog(ctx)
+    activeChoiceDialog.View = loadlayout(choiceLayout)
+
+    btn_pick_text_feedback.setBackground(makeBoxDrawable(0xFF047857, 18, 2, 0xFF10B981))
+    btn_pick_text_feedback.setTextColor(0xFFFFFFFF)
+    btn_pick_text_feedback.setTypeface(Typeface.DEFAULT_BOLD)
+
+    btn_pick_voice_feedback.setBackground(makeBoxDrawable(0xFF1E3A8A, 18, 2, 0xFF3B82F6))
+    btn_pick_voice_feedback.setTextColor(0xFFFFFFFF)
+    btn_pick_voice_feedback.setTypeface(Typeface.DEFAULT_BOLD)
+
+    btn_pick_cancel_feedback.setBackground(makeBoxDrawable(0xFF111827, 18, 2, 0xFF475569))
+    btn_pick_cancel_feedback.setTextColor(0xFF94A3B8)
+
+    pcall(function() if service and service.speak then service.speak("Choose Feedback Mode: Text or Voice") end end)
+
+    btn_pick_text_feedback.onClick = function()
+        activeChoiceDialog.dismiss()
+        showTextFeedbackDialog()
+    end
+
+    btn_pick_voice_feedback.onClick = function()
+        activeChoiceDialog.dismiss()
+        showVoiceFeedbackDialog()
+    end
+
+    btn_pick_cancel_feedback.onClick = function()
+        activeChoiceDialog.dismiss()
+    end
+
+    activeChoiceDialog.show()
+end
+
+showImageRecogniserAboutDialog = function()
+    local aboutLayout = {
+        ScrollView,
+        layout_width = "fill",
+        layout_height = "wrap_content",
+        background = "#0B0F19",
+        {
+            LinearLayout,
+            orientation = "vertical",
+            layout_width = "fill",
+            layout_height = "wrap_content",
+            padding = "22dp",
+            gravity = "center_horizontal",
+            {
+                TextView,
+                id = "txt_about_header_title",
+                text = "Pro Image Recogniser",
+                textSize = "22sp",
+                textColor = "#F59E0B",
+                gravity = "center",
+                layout_width = "fill",
+                layout_marginBottom = "4dp"
+            },
+            {
+                TextView,
+                text = "Created by: Mamoon (Mamoon Abdullah)",
+                textSize = "15sp",
+                textColor = "#10B981",
+                gravity = "center",
+                layout_width = "fill",
+                layout_marginBottom = "14dp"
+            },
+            {
+                TextView,
+                id = "txt_about_full_description",
+                text = IMAGE_RECOGNISER_DESCRIPTION,
+                textSize = "15sp",
+                textColor = "#E2E8F0",
+                layout_width = "fill",
+                layout_marginBottom = "22dp"
+            },
+            {
+                TextView,
+                text = "Developer Support & Community",
+                textSize = "17sp",
+                textColor = "#38BDF8",
+                gravity = "center",
+                layout_width = "fill",
+                layout_marginBottom = "14dp"
+            },
+            {
+                Button,
+                id = "btn_about_youtube_link",
+                text = "YouTube Channel (@instructor-of-BTW)",
+                textSize = "15sp",
+                layout_width = "fill",
+                layout_height = "52dp",
+                layout_marginBottom = "12dp"
+            },
+            {
+                Button,
+                id = "btn_about_whatsapp_group",
+                text = "WhatsApp Community Group",
+                textSize = "15sp",
+                layout_width = "fill",
+                layout_height = "52dp",
+                layout_marginBottom = "12dp"
+            },
+            {
+                Button,
+                id = "btn_about_feedback_contact",
+                text = "Developer Feedback (WhatsApp)",
+                textSize = "15sp",
+                layout_width = "fill",
+                layout_height = "52dp",
+                layout_marginBottom = "16dp"
+            },
+            {
+                Button,
+                id = "btn_about_close_dialog",
+                text = "Close",
+                textSize = "16sp",
+                layout_width = "fill",
+                layout_height = "52dp"
+            }
+        }
+    }
+
+    activeAboutDialog = LuaDialog(ctx)
+    activeAboutDialog.View = loadlayout(aboutLayout)
+
+    txt_about_header_title.setTypeface(Typeface.DEFAULT_BOLD)
+
+    btn_about_youtube_link.setBackground(makeBoxDrawable(0xFF7F1D1D, 18, 2, 0xFFEF4444))
+    btn_about_youtube_link.setTextColor(0xFFFFFFFF)
+    btn_about_youtube_link.setTypeface(Typeface.DEFAULT_BOLD)
+
+    btn_about_whatsapp_group.setBackground(makeBoxDrawable(0xFF064E3B, 18, 2, 0xFF10B981))
+    btn_about_whatsapp_group.setTextColor(0xFFFFFFFF)
+    btn_about_whatsapp_group.setTypeface(Typeface.DEFAULT_BOLD)
+
+    btn_about_feedback_contact.setBackground(makeBoxDrawable(0xFF1E3A8A, 18, 2, 0xFF3B82F6))
+    btn_about_feedback_contact.setTextColor(0xFFFFFFFF)
+    btn_about_feedback_contact.setTypeface(Typeface.DEFAULT_BOLD)
+
+    btn_about_close_dialog.setBackground(makeBoxDrawable(0xFF111827, 18, 2, 0xFF475569))
+    btn_about_close_dialog.setTextColor(0xFF94A3B8)
+
+    pcall(function() if service and service.speak then service.speak("Pro Image Recogniser. Created by Mamoon.") end end)
+
+    btn_about_youtube_link.onClick = function()
+        openExternalWebUrl(YOUTUBE_CHANNEL_URL)
+    end
+
+    btn_about_whatsapp_group.onClick = function()
+        openExternalWebUrl(WHATSAPP_COMMUNITY_URL)
+    end
+
+    btn_about_feedback_contact.onClick = function()
+        showFeedbackChoiceDialog()
+    end
+
+    btn_about_close_dialog.onClick = function()
+        activeAboutDialog.dismiss()
+    end
+
+    activeAboutDialog.show()
+end
+
+aboutAndSupport = showImageRecogniserAboutDialog
+showAboutDialog = showImageRecogniserAboutDialog
+
+-- ==================== MAIN UI ====================
+function createMainUI()
+    runOnMain(function()
+        local layout = LinearLayout(ctx)
+        layout.setOrientation(1)
+        layout.setPadding(40, 40, 40, 40)
+        layout.setBackgroundColor(LIGHT_BLUE)
+
+        local devLabel = TextView(ctx)
+        devLabel.setText("Developed by Bridge Tech (Groq)")
+        devLabel.setTextColor(0xFF000000)
+        devLabel.setGravity(Gravity.CENTER)
+        layout.addView(devLabel)
+
+        local btnScan = Button(ctx)
+        btnScan.setText("CHOOSE FROM GALLERY")
+        btnScan.onClick = function() scanAllImages() end
+        layout.addView(btnScan)
+
+        _G.statusLabel = TextView(ctx)
+        _G.statusLabel.setText("No file selected")
+        _G.statusLabel.setTextColor(0xFF000000)
+        _G.statusLabel.setPadding(0, 20, 0, 20)
+        _G.statusLabel.setGravity(Gravity.CENTER)
+        layout.addView(_G.statusLabel)
+
+        local processBtn = Button(ctx)
+        processBtn.setText("Process Selected Image")
+        processBtn.setBackgroundColor(0xFFFF9800)
+        processBtn.onClick = function()
+            if isProcessing then notify("Already processing"); return end
+            if selectedPhotoPath == "" then notify("Please select an image first"); return end
+            local b64 = pathToBase64(selectedPhotoPath)
+            if not b64 then notify("Failed to load image"); return end
+            isProcessing = true
+            startProcessingSound()
+            notify("Processing with Groq...")
+
+            local prompt = buildDescriptionPrompt()
+
+            askGroqWithHistory(prompt, b64, nil, function(res, err)
+                stopProcessingSound()
+                isProcessing = false
+                showInteractiveResultDialog("Result & Chat (Groq)", res or ("Error: " .. tostring(err)), b64)
+            end)
+        end
+        layout.addView(processBtn)
+
+        local bottom = LinearLayout(ctx)
+        bottom.setOrientation(0)
+        bottom.setLayoutParams(LinearLayout.LayoutParams(-1, -2))
+
+        local btnSettings = Button(ctx)
+        btnSettings.setText("Settings")
+        btnSettings.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
+        btnSettings.onClick = function() showSettingsDialog() end
+        bottom.addView(btnSettings)
+
+        local btnAbout = Button(ctx)
+        btnAbout.setText("About")
+        btnAbout.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
+        btnAbout.onClick = function() aboutAndSupport() end
+        bottom.addView(btnAbout)
+
+        local btnExit = Button(ctx)
+        btnExit.setText("Exit")
+        btnExit.setLayoutParams(LinearLayout.LayoutParams(0, -2, 1))
+        btnExit.onClick = function() if mainDlg then mainDlg.dismiss(); mainDlg = nil end end
+        bottom.addView(btnExit)
+
+        layout.addView(bottom)
+
+        mainDlg = LuaDialog(ctx)
+        mainDlg.setTitle("Pro Image Recogniser")
+        mainDlg.setView(layout)
+        mainDlg.show()
+        applyLightBlue(mainDlg)
+    end)
+end
+
+-- ==================== TRIGGER ====================
+function onTrigger()
+    local target = resolveTargetImage()
+    if target then
+        processFocusedImage(target)
+    else
+        createMainUI()
+    end
+end
+
+onTrigger()
